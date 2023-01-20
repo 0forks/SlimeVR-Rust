@@ -204,17 +204,19 @@ pub struct Vqf {
 }
 
 impl Vqf {
-	pub fn new(gyrTs: f32, accTs: f32, magTs: f32, params: VqfParameters) -> Vqf {
-		Vqf {
+	pub fn new(gyrTs: f32, accTs: Option<f32>, magTs: Option<f32>, params: VqfParameters) -> Vqf {
+		let mut vqf = Vqf {
 			_params: params,
 			_state: Default::default(),
 			_coeffs: VQFCoefficients {
 				gyrTs,
-				accTs,
-				magTs,
+				accTs: accTs.unwrap_or(gyrTs),
+				magTs: magTs.unwrap_or(gyrTs),
 				..Default::default()
 			},
-		}
+		};
+		vqf._setup();
+		vqf
 	}
 
 	pub fn updateGyr(&mut self, gyr: Vec3) {
@@ -305,7 +307,7 @@ impl Vqf {
 		);
 
 		// transform to 6D earth frame and normalize
-		let accEarth = self._state.accQuat * self._state.lastAccLp;
+		let accEarth = (self._state.accQuat * self._state.lastAccLp).normalize();
 
 		// inclination correction
 		let q_w = ((accEarth[2] + 1.0) / 2.0).sqrt();
@@ -578,6 +580,93 @@ impl Vqf {
 	pub fn getQuat6D(&self) -> Quat {
 		self._state.accQuat * self.getQuat3D()
 	}
+
+	pub fn resetState(&mut self) {
+		self._state = Default::default();
+		self._state.biasP = self._coeffs.biasP0 * Mat3x3::identity();
+		self._state.magRejectT = self._params.magMaxRejectionTime;
+	}
+
+	fn _setup(&mut self) {
+		let coeffs = &mut self._coeffs;
+		let params = &mut self._params;
+
+		assert!(coeffs.gyrTs > 0.);
+		assert!(coeffs.accTs > 0.);
+		assert!(coeffs.magTs > 0.);
+
+		(coeffs.accLpB, coeffs.accLpA) = filterCoeffs(params.tauAcc, coeffs.accTs);
+
+		coeffs.kMag = gainFromTau(params.tauMag, coeffs.magTs);
+
+		coeffs.biasP0 = (params.biasSigmaInit*100.0).powf(2.);
+		// # the system noise increases the variance from 0 to (0.1 °/s)^2 in biasForgettingTime seconds
+		coeffs.biasV = (0.1*100.0).powf(2.) * coeffs.accTs/params.biasForgettingTime;
+		let pMotion = (params.biasSigmaMotion*100.0).powf(2.);
+		coeffs.biasMotionW = pMotion.powf(2.) / coeffs.biasV + pMotion;
+		// coeffs.biasVerticalW = coeffs.biasMotionW / max(params.biasVerticalForgettingFactor, 1e-10);
+		coeffs.biasVerticalW = coeffs.biasMotionW / params.biasVerticalForgettingFactor.max(1.0e-10);
+
+		let pRest = (params.biasSigmaRest*100.0).powf(2.);
+		coeffs.biasRestW = pRest.powf(2.) / coeffs.biasV + pRest;
+
+		(coeffs.restGyrLpB, coeffs.restGyrLpA) = filterCoeffs(params.restFilterTau, coeffs.gyrTs);
+		(coeffs.restAccLpB, coeffs.restAccLpA) = filterCoeffs(params.restFilterTau, coeffs.accTs);
+
+		coeffs.kMagRef = gainFromTau(params.magRefTau, coeffs.magTs);
+		if params.magCurrentTau > 0. {
+				(coeffs.magNormDipLpB, coeffs.magNormDipLpA) = filterCoeffs(params.magCurrentTau, coeffs.magTs);
+		}
+
+		self.resetState();
+	}
+}
+
+// fn quatRotate(q: Quat, v: Vec3) -> Vec3 {
+// 	let (q0, q1, q2, q3) = (q.w, q.i, q.j, q.k);
+// 	let (v0, v1, v2) = (v.x, v.y, v.z);
+// 	let x = (1. - 2.*q2*q2 - 2.*q3*q3)*v0 + 2.*v1*(q2*q1 - q0*q3) + 2.*v2*(q0*q2 + q3*q1);
+// 	let y = 2.*v0*(q0*q3 + q2*q1) + v1*(1. - 2.*q1*q1 - 2.*q3*q3) + 2.*v2*(q2*q3 - q1*q0);
+// 	let z = 2.*v0*(q3*q1 - q0*q2) + 2.*v1*(q0*q1 + q3*q2) + v2*(1. - 2.*q1*q1 - 2.*q2*q2);
+// 	Vec3::new(x, y, z)
+// }
+
+fn gainFromTau(tau: f32, Ts: f32) -> f32 {
+		assert!(Ts > 0.);
+		if tau < 0. {
+				0.0  // k=0 for negative tau (disable update)
+		} else if tau == 0.0 {
+				1.0  // k=1 for tau=0
+		} else {
+				1.0 - (-Ts/tau).exp()  // fc = 1/(2*pi*tau)
+		}
+}
+
+fn filterCoeffs(tau: f32, Ts: f32) -> (Vec3, Vec2) {
+	assert!(tau > 0.);
+	assert!(Ts > 0.);
+	// # second order Butterworth filter based on https://stackoverflow.com/a/52764064
+	// fc = math.sqrt(2) / (2.0 * math.pi * tau)  # time constant of dampened, non-oscillating part of step response
+	let fc = 2.0.sqrt() / (2.0 * PI * tau);
+
+	// C = math.tan(math.pi*fc*Ts)
+	let C = (PI * fc * Ts).tan();
+
+	// D = C**2 + math.sqrt(2)*C + 1
+	let D = C.powf(2.) + 2.0.sqrt()*C + 1.;
+	// b0 = C*C/D
+	let b0 = C*C/D;
+	// b1 = 2*b0
+	let b1 = 2. * b0;
+	// b2 = b0
+	let b2 = b0;
+	// # a0 = 1.0
+	// a1 = 2*(C**2-1)/D
+	let a1 = 2. * (C.powf(2.) - 1.) / D;
+	// a2 = (1-math.sqrt(2)*C+C**2)/D
+	let a2 = (1. - 2.0.sqrt() * C + C.powf(2.))/D;
+	// return np.array([b0, b1, b2], float), np.array([a1, a2], float)
+	(Vec3::new(b0, b1, b2), Vec2::new(a1, a2))
 }
 
 fn filterVec<const N: usize, const M: usize>(
@@ -598,7 +687,7 @@ fn filterVec<const N: usize, const M: usize>(
 	nalgebra::Const<1>,
 	ArrayStorage<f32, N, 1>,
 > {
-	assert!(M >= N);
+	assert!(N >= 2);
 	// to avoid depending on a single sample, average the first samples (for duration tau)
 	// and then use this average to calculate the filter initial state
 	if state[(0, 0)].is_nan() {
