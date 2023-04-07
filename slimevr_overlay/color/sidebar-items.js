@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"macro":[["def_color",""]],"struct":[["RGBA",""]]};

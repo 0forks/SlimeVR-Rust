@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":[["ShutdownReason",""]],"struct":[["Broadcaster","Allows signalling a shutdown, with a particular reason `ShutdownReason<R>` for the shutdown. Also allows for listening to an acknowledgement `A` of the shutdown from the various listeners."],["Listener","Generics"]]};

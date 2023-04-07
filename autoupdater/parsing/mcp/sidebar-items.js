@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":[["MaybeCrossPlatform","This enum allows us to represent a `T` that may or may not depend on the platform that we wish to install for."]],"type":[["MCP","Type alias so we don’t have long ass names"]]};
